@@ -8,6 +8,7 @@ import networks
 import scipy.io as sio
 import param
 import truncated_vgg
+import glob
 from keras.models import load_model, Model
 from keras.backend.tensorflow_backend import set_session
 
@@ -17,7 +18,8 @@ def train(dataset, gpu_id):
     gpu = '/gpu:' + str(gpu_id)
 
     np.random.seed(17)
-    feed = data_generation.create_feed(params, 'test_vids.txt', False, True)
+    feed = data_generation.create_feed(params, '../data/test/', '', False, True)
+    #feed = data_generation.create_feed_ours(params)
 
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
@@ -27,7 +29,7 @@ def train(dataset, gpu_id):
     with tf.device(gpu):
         vgg_model = truncated_vgg.vgg_norm()
         networks.make_trainable(vgg_model, False)
-        response_weights = sio.loadmat('mean_response.mat')
+        response_weights = sio.loadmat('../data/vgg_activation_distribution_train.mat')
         fgbg = networks.network_posewarp(params)
         fgbg.load_weights('../models/vgg+gan_5000.h5')
         # disc = networks.discriminator(params)
@@ -43,13 +45,27 @@ def train(dataset, gpu_id):
         outputs.append(fgbg.get_layer('fg_mask_tgt').output)
         model = Model(fgbg.inputs, outputs)
 
-    n_batches = 10
-    for j in xrange(n_batches):
-        print(j)
-        X, Y = next(feed)
-        pred = model.predict(X[:-2])
+    imgfiles = glob.glob('/scratch/rzhou/posewarp-cvpr2018/poses/All/*.jpg')
+    imgfiles = sorted(imgfiles)
 
-        sio.savemat('results/fgbg_vgg/' + str(j) + '.mat', {'X': X[0], 'Y': Y, 'pred': pred[0], 'mask_src': pred[1],
+    count = 0
+    for i in range(69):
+        for j in range(15):
+            img = imgfiles[count]
+            base = os.path.basename(img)
+            filename = os.path.splitext(base)[0]
+            print(str(count) + " : filename: " + filename)
+            matfile = '/scratch/rzhou/posewarp-cvpr2018/poses/pose/' + filename + '.mat'
+
+            if (not os.path.isfile(matfile)):
+                count = count + 1
+                print('missing people ' + str(i) + ', pose ' + str(j))
+                continue
+            count = count + 1
+            X, Y = data_generation.create_feed_ours(params, img, matfile)
+            pred = model.predict(X[:-2])
+
+            sio.savemat('results/fgbg_vgg/' + filename + '.mat', {'X': X[0], 'Y': Y, 'pred': pred[0], 'mask_src': pred[1],
                                                             'fg_stack': pred[2], 'bg_src': pred[3], 'bg_tgt': pred[4],
                                                             'fg_tgt': pred[5], 'fg_mask_tgt': pred[6],
                                                             'prior': X[3], 'pose_src': X[-2], 'pose_tgt': X[-1]})

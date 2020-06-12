@@ -50,8 +50,25 @@ def read_frame(vid_name, frame_num, box, x):
 
     return img, joints, scale, pos
 
+def read_frame_ours(img_name, box, x):
+    #img_name = os.path.join(vid_name, str(frame_num + 1) + '.jpg')
+    #if not os.path.isfile(img_name):
+    #    img_name = os.path.join(vid_name, str(frame_num + 1) + '.png')
+
+    img = cv2.imread(img_name)
+    #print(img)
+    joints = x - 1.0
+    box_frame = box
+    scale = get_person_scale(joints)
+    pos = np.zeros(2)
+    pos[0] = (box_frame[0] + box_frame[2] / 2.0)
+    pos[1] = (box_frame[1] + box_frame[3] / 2.0)
+
+    return img, joints, scale, pos
+
 
 def warp_example_generator(vid_info_list, param, do_augment=True, return_pose_vectors=False):
+    print('aaa')
     img_width = param['IMG_WIDTH']
     img_height = param['IMG_HEIGHT']
     pose_dn = param['posemap_downsample']
@@ -145,6 +162,86 @@ def create_feed(params, data_dir, mode, do_augment=True, return_pose_vectors=Fal
         feed = warp_example_generator(vid_info_list, params, do_augment, return_pose_vectors)
 
     return feed
+
+def create_feed_ours(param, img, matfile):
+    img_width = param['IMG_WIDTH']
+    img_height = param['IMG_HEIGHT']
+    pose_dn = param['posemap_downsample']
+    sigma_joint = param['sigma_joint']
+    n_joints = param['n_joints']
+    scale_factor = param['obj_scale_factor']
+    batch_size = param['batch_size']
+    limbs = param['limbs']
+    n_limbs = param['n_limbs']
+
+    x_src = np.zeros((batch_size, img_height, img_width, 3))
+    x_mask_src = np.zeros((batch_size, img_height, img_width, n_limbs + 1))
+    x_pose_src = np.zeros((batch_size, int(img_height / pose_dn), int(img_width / pose_dn), n_joints))
+    x_pose_tgt = np.zeros((batch_size, int(img_height / pose_dn), int(img_width / pose_dn), n_joints))
+    x_trans = np.zeros((batch_size, 2, 3, n_limbs + 1))
+    x_posevec_src = np.zeros((batch_size, n_joints * 2))
+    x_posevec_tgt = np.zeros((batch_size, n_joints * 2))
+    y = np.zeros((batch_size, img_height, img_width, 3))
+
+    imgfiles = glob.glob('/scratch/rzhou/posewarp-cvpr2018/poses/All/*.jpg')
+    imgfiles = sorted(imgfiles)
+
+    count = 69 * 15
+    target = []
+    for i in range(15):
+        img1 = imgfiles[count]
+        base = os.path.basename(img1)
+        filename = os.path.splitext(base)[0]
+        matfile1 = '/scratch/rzhou/posewarp-cvpr2018/poses/pose/' + filename + '.mat'
+        x = sio.loadmat(matfile1)
+        target.append([x['box'], x['X'], img1])
+        count = count + 1
+
+    x = sio.loadmat(matfile)
+
+    for i in range(batch_size):
+        I0, joints0, scale0, pos0 = read_frame_ours(img, x['box'][0], x['X'])
+        I1, joints1, scale1, pos1 = read_frame_ours(target[i][2], target[i][0][0], target[i][1])
+
+        if scale0 > scale1:
+            scale = scale_factor / scale0
+        else:
+            scale = scale_factor / scale1
+
+        pos = (pos0 + pos1) / 2.0
+
+        I0, joints0 = center_and_scale_image(I0, img_width, img_height, pos, scale, joints0)
+        I1, joints1 = center_and_scale_image(I1, img_width, img_height, pos, scale, joints1)
+        #print(I0)
+        I0 = (I0.astype('float') / 255.0 - 0.5) * 2.0
+        I1 = (I1.astype('float') / 255.0 - 0.5) * 2.0
+        #print(I0)
+        posemap0 = make_joint_heatmaps(img_height, img_width, joints0, sigma_joint, pose_dn)
+        posemap1 = make_joint_heatmaps(img_height, img_width, joints1, sigma_joint, pose_dn)
+
+        src_limb_masks = make_limb_masks(limbs, joints0, img_width, img_height)
+        src_bg_mask = np.expand_dims(1.0 - np.amax(src_limb_masks, axis=2), 2)
+        src_masks = np.log(np.concatenate((src_bg_mask, src_limb_masks), axis=2) + 1e-10)
+
+        x_src[i, :, :, :] = I0
+        x_pose_src[i, :, :, :] = posemap0
+        x_pose_tgt[i, :, :, :] = posemap1
+        x_mask_src[i, :, :, :] = src_masks
+        x_trans[i, :, :, 0] = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        x_trans[i, :, :, 1:] = get_limb_transforms(limbs, joints0, joints1)
+
+        x_posevec_src[i, :] = joints0.flatten()
+        x_posevec_tgt[i, :] = joints1.flatten()
+
+        y[i, :, :, :] = I1
+
+    out = [x_src, x_pose_src, x_pose_tgt, x_mask_src, x_trans]
+
+    
+    out.append(x_posevec_src)
+    out.append(x_posevec_tgt)
+
+    return (out, y)
 
 
 '''
@@ -297,14 +394,15 @@ def augment(I, joints, rflip, rscale, rshift, rdegree, rsat, img_height, img_wid
 
 def center_and_scale_image(I, img_width, img_height, pos, scale, joints):
     I = cv2.resize(I, (0, 0), fx=scale, fy=scale)
+    #print(np.shape(I))
     joints = joints * scale
 
     x_offset = (img_width - 1.0) / 2.0 - pos[0] * scale
     y_offset = (img_height - 1.0) / 2.0 - pos[1] * scale
-
-    T = np.float32([[1, 0, x_offset], [0, 1, y_offset]])
+    #print((x_offset,y_offset))
+    T = np.float32([[1,0,x_offset],[0,1,y_offset]])
+    #T = np.float32([[1, 0, x_offset], [0, 1, y_offset]])
     I = cv2.warpAffine(I, T, (img_width, img_height))
-
     joints[:, 0] += x_offset
     joints[:, 1] += y_offset
 
